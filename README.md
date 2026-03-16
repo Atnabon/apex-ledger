@@ -1,1 +1,2 @@
-# agentic-event-store
+# agentic-event
+
