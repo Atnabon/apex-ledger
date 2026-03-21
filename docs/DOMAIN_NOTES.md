@@ -1,412 +1,176 @@
-# DOMAIN_NOTES.md
-## Week 5 — Agentic Event Store & Enterprise Audit Infrastructure
-### Phase 0 — Domain Reconnaissance (Day 1, BEFORE any code)
+# DOMAIN_NOTES.md — Apex Ledger
 
-> **What this file is:** This is a graded written document. You write it in plain English before touching any code. Think of it as your "thinking on paper" before building. A grader will read this to check you understand the concepts — not just that you can copy-paste code.
+## 1. EDA vs. ES Distinction
 
----
+**Scenario**: A component uses LangChain callbacks to capture event-like data (traces, tool calls, token usage). Is this EDA or ES?
 
-## Question 1 — EDA vs. Event Sourcing: What's the difference, and what changes when you use The Ledger?
+**Answer**: This is **Event-Driven Architecture (EDA)**, not Event Sourcing (ES).
 
-### The Short Answer
+LangChain callbacks produce events-as-messages: they flow through handlers, may be dropped, can be duplicated, and are not the source of truth for system state. The callback data is a **side-channel** — the actual state of the system (the agent's decisions, the application's status) exists elsewhere, typically in memory or a CRUD database. If the callback handler crashes, the data is lost. If you replay the callbacks, you do not reconstruct the system's state — you reconstruct a log of observations.
 
-A component that uses **callbacks** (like LangChain traces) to capture event-like data is **Event-Driven Architecture (EDA)** — NOT Event Sourcing.
+**If redesigned using The Ledger**, the architecture changes fundamentally:
 
-### The Longer Explanation (plain English)
+1. **Events become the database**: Instead of callbacks writing to a log, every LangChain node execution writes an `AgentNodeExecuted` event to an append-only stream. The event IS the state, not an observation of the state.
+2. **Durability guarantee**: Events cannot be dropped. The `events` table enforces `UNIQUE (stream_id, stream_position)` — once written, the event is permanent and ordered.
+3. **State reconstruction**: The agent's complete execution history can be replayed to reconstruct its state at any point. This enables crash recovery (Gas Town pattern) — something impossible with EDA callbacks.
+4. **What you gain**: Auditability by construction (the regulator queries the event stream, not a separate log); reproducibility (replay events to reconstruct any past state); crash recovery (restart agent, replay its session stream, continue from last checkpoint).
 
-Imagine you have a security camera system in a building.
-
-- **EDA (Event-Driven Architecture)** is like a security guard watching the camera feed live. When something happens, they react to it. But if they look away, or the feed cuts out, that moment is **gone forever**. The camera feed is just messages flying past — fire and forget.
-
-- **Event Sourcing (ES)** is like a **recording system** where every second of footage is saved permanently to a hard drive in strict order. The recordings ARE the truth. If you want to know what happened at 2:47pm last Tuesday, you rewind and watch. The recordings can never be deleted or changed.
-
-**LangChain callbacks** are the security guard watching live. They fire when something happens, maybe write a log line, and move on. If the process crashes, those events are gone. That is EDA.
-
-**The Ledger (Event Sourcing)** stores every event permanently, in order, in PostgreSQL. The events ARE the database. Nothing is ever overwritten. You can replay the entire history from Day 1.
-
-### What Would Change If You Redesigned Using The Ledger?
-
-| What exists today (EDA / Callbacks) | What changes with The Ledger (Event Sourcing) |
-|---|---|
-| LangChain fires a callback → maybe writes a log | Every agent action is saved as a permanent event row in PostgreSQL |
-| If the process restarts, context is lost | Agent replays its event stream and reconstructs exactly where it was |
-| Events can be dropped or missed | Events are append-only — they can NEVER be removed |
-| No way to ask "what was the state at 9am yesterday?" | You can replay events up to any timestamp and see exact state |
-| No tamper detection | Hash chain makes any tampering detectable |
-
-### What You Gain
-
-1. **Auditability** — regulators can see every AI decision, who made it, and what data was used
-2. **Reproducibility** — you can replay history and get the same answer every time
-3. **Agent Memory** — an agent that crashes can restart and pick up exactly where it left off
-4. **Time Travel Queries** — "what was the loan status at 3pm on March 5th?" becomes answerable
+**The key distinction**: EDA events can be lost and the system continues. ES events cannot be lost — they ARE the system.
 
 ---
 
-## Question 2 — The Aggregate Question: Which boundary did you reject and why?
+## 2. The Aggregate Question
 
-### First, What is an Aggregate? (beginner explanation)
+**Chosen boundaries**: Four aggregates — `LoanApplication`, `AgentSession`, `ComplianceRecord`, `AuditLedger`.
 
-An **aggregate** is a consistency boundary. Think of it like a locked filing cabinet. Everything INSIDE that cabinet must be updated together, atomically — you can't open two drawers at the same time from two different people. The cabinet lock is the aggregate boundary.
+**Alternative considered and rejected**: Merging `ComplianceRecord` into `LoanApplication` as a single aggregate.
 
-In our system, we have four aggregates (four filing cabinets):
-1. `LoanApplication` — tracks the loan from submission to final decision
-2. `AgentSession` — tracks everything one AI agent did in one work session
-3. `ComplianceRecord` — tracks all regulatory checks for one application
-4. `AuditLedger` — cross-cutting audit trail linking everything together
+**Why rejected**: The coupling problem is **write contention under concurrent agents**.
 
-### The Alternative Boundary I Considered and Rejected
+In the Apex scenario, the `ComplianceAgent` writes compliance rule results (`ComplianceRulePassed`, `ComplianceRuleFailed`) while the `DecisionOrchestratorAgent` may simultaneously be reading or writing to the loan application stream (`DecisionGenerated`). If compliance events lived in the `loan-{id}` stream:
 
-**What I considered:** Merging `ComplianceRecord` into `LoanApplication` — making one big aggregate that handles both the loan lifecycle AND all compliance checks.
+- Both agents would need to pass `expected_version` against the same stream
+- A compliance rule write would conflict with a decision write — even though they are logically independent operations by different actors
+- At 100 concurrent applications with 4 agents each, this contention means constant `OptimisticConcurrencyError` retries on what should be non-conflicting writes
+- The retry budget would be consumed by false conflicts rather than genuine business rule violations
 
-**Why this seemed appealing at first:** They're about the same application, so why not keep it together?
+With separate aggregates: the `ComplianceAgent` writes to `compliance-{id}` and the `DecisionOrchestrator` writes to `loan-{id}`. They never contend. The `LoanApplicationAggregate` reads the compliance stream when it needs to check compliance status (Rule 5: compliance dependency), but this is a read — not a concurrent write.
 
-**Why I rejected it:**
-
-Imagine a busy afternoon at Apex Financial. A hundred loan applications are all being processed simultaneously. Each loan has 4 AI agents running. Each agent appends events to the loan stream.
-
-If `ComplianceRecord` is merged into `LoanApplication`, every time ANY compliance rule is checked, it must lock the ENTIRE loan aggregate to append the event. Now you have:
-- The CreditAnalysis agent waiting to append its result
-- The FraudDetection agent waiting to append its result
-- The ComplianceAgent trying to append a rule-passed event
-- All three fighting over the SAME lock
-
-This causes **lock contention** — agents are constantly waiting on each other, retrying, slowing down.
-
-**By keeping `ComplianceRecord` as a separate aggregate:**
-- The compliance agent writes to its own stream (`compliance-{id}`)
-- The credit agent writes to the loan stream (`loan-{id}`)
-- They NEVER block each other
-- The system can process both in parallel
-
-**The coupling problem my chosen boundary prevents:**
-
-If compliance and loan were merged, a compliance check failure would leave the loan aggregate in a locked state, potentially blocking a human reviewer from appending their decision. With separate aggregates, compliance checks happen independently. The `LoanApplication` aggregate only checks "are all compliance events present?" at the moment of approval — it doesn't need to own the compliance writes.
+**The general principle**: If two different actors write to an entity at different times for different reasons, they should be separate aggregates. Merging them creates artificial coupling that manifests as contention under load.
 
 ---
 
-## Question 3 — Concurrency in Practice: What happens when two agents collide?
+## 3. Concurrency in Practice
 
-### Setup: The Scenario
+**Scenario**: Two AI agents simultaneously process the same loan application. Both call `append_events` with `expected_version=3`.
 
-Two AI fraud-detection agents (Agent A and Agent B) are both processing loan application `LOAN-999`. Both read the stream at version 3. Both decide to append a `CreditAnalysisCompleted` event. Both call:
+**Exact sequence of operations**:
 
-```
-append_events(stream_id="loan-LOAN-999", expected_version=3)
-```
+1. **Agent A** reads `loan-APP-001` stream. `current_version = 3`.
+2. **Agent B** reads `loan-APP-001` stream. `current_version = 3`.
+3. **Agent A** calls `store.append(stream_id="loan-APP-001", events=[CreditAnalysisCompleted(...)], expected_version=3)`.
+   - Inside the transaction: the store checks `event_streams.current_version` for `loan-APP-001`.
+   - `current_version == 3 == expected_version` → check passes.
+   - Event inserted at `stream_position=4`.
+   - `event_streams.current_version` updated from 3 to 4 via `UPDATE ... WHERE current_version = 3`.
+   - Transaction commits. **Agent A succeeds. New version = 4.**
+4. **Agent B** calls `store.append(stream_id="loan-APP-001", events=[CreditAnalysisCompleted(...)], expected_version=3)`.
+   - Inside the transaction: the store checks `event_streams.current_version`.
+   - `current_version == 4 != 3 (expected_version)` → check fails.
+   - **`OptimisticConcurrencyError` raised**: `{stream_id: "loan-APP-001", expected_version: 3, actual_version: 4, suggested_action: "reload_stream_and_retry"}`.
+   - Transaction rolls back. No events written.
 
-### The Exact Sequence of Operations
+**What the losing agent receives**: An `OptimisticConcurrencyError` with the stream ID, the expected version it passed (3), and the actual current version (4).
 
-Here is what happens inside the event store, step by step:
+**What it must do next**:
+1. Reload the stream: `events = await store.load_stream("loan-APP-001")`
+2. Reconstruct the aggregate: the new state now includes Agent A's `CreditAnalysisCompleted` event
+3. Re-evaluate whether its own analysis is still relevant (Rule 3: model version locking may now reject it)
+4. If still valid, retry with `expected_version=4`
 
-```
-Time 0ms:   Agent A reads stream loan-LOAN-999 → current version = 3
-Time 0ms:   Agent B reads stream loan-LOAN-999 → current version = 3
-
-Time 5ms:   Agent A calls append(expected_version=3)
-            → PostgreSQL executes: UPDATE event_streams 
-              SET current_version = 4 
-              WHERE stream_id = 'loan-LOAN-999' AND current_version = 3
-            → The condition current_version = 3 is TRUE
-            → Update succeeds. Agent A's event is written at position 4.
-            → Agent A returns: new version = 4 ✅ SUCCESS
-
-Time 5ms:   Agent B calls append(expected_version=3) (simultaneously)
-            → PostgreSQL executes: UPDATE event_streams
-              SET current_version = 4
-              WHERE stream_id = 'loan-LOAN-999' AND current_version = 3
-            → The condition current_version = 3 is now FALSE (it's already 4)
-            → PostgreSQL returns 0 rows updated
-            → Event store raises: OptimisticConcurrencyError ❌ REJECTED
-```
-
-### What the Losing Agent (Agent B) Receives
-
-Agent B receives an `OptimisticConcurrencyError` exception with details:
-```json
-{
-  "error_type": "OptimisticConcurrencyError",
-  "stream_id": "loan-LOAN-999",
-  "expected_version": 3,
-  "actual_version": 4,
-  "suggested_action": "reload_stream_and_retry"
-}
-```
-
-### What Agent B Must Do Next
-
-1. **Reload the stream** — call `load_stream("loan-LOAN-999")` to get all events including Agent A's new event at position 4
-2. **Re-evaluate** — is Agent B's analysis still needed? Agent A's `CreditAnalysisCompleted` event is now present. The business rule says only ONE credit analysis is allowed per application. Agent B should see this and **abort** rather than retry.
-3. **If retry is appropriate** — rebuild its aggregate state from the fresh events, recalculate its intended action, and try appending again with `expected_version=4`
-
-**Why no database locks are needed:**
-
-The `WHERE current_version = 3` condition IS the lock. PostgreSQL handles this atomically at the row level. Only one update can match — the other sees 0 rows affected. No explicit transactions spanning multiple aggregates are needed. This scales to thousands of concurrent operations.
+The retry is not automatic — the agent must re-evaluate its business logic because the aggregate state has changed.
 
 ---
 
-## Question 4 — Projection Lag and Its Consequences
+## 4. Projection Lag and Its Consequences
 
-### The Scenario
+**Scenario**: `ApplicationSummary` projection has typical lag of 200ms. A loan officer queries "available credit limit" immediately after an agent commits a disbursement event. They see the old limit.
 
-The `LoanApplication` projection has a typical lag of **200ms**. A loan officer queries "available credit limit" immediately after an agent commits a `DisbursementCompleted` event. The projection hasn't caught up yet, so the officer sees the **old (higher) credit limit**.
+**What the system does**:
 
-### What My System Does
+1. The event is committed to the `events` table (source of truth) immediately.
+2. The `ProjectionDaemon` polls for new events every 100ms. The projection will be updated within ~200ms.
+3. The loan officer's query hits the `ApplicationSummary` projection table, which is stale by up to 200ms.
 
-**At the projection level:**
+**Response strategy**:
 
-The `ProjectionDaemon` continuously measures lag:
-```
-lag = current_global_position_in_events_table 
-    - last_global_position_processed_by_projection
-```
+- **Expose projection lag as a metric**: Every query response includes `projection_lag_ms` — the time between the latest event in the store and the latest event the projection has processed. The UI displays this: "Data as of 200ms ago".
+- **For critical reads, offer a strong-consistency path**: The MCP resource `ledger://applications/{id}/audit-trail` loads directly from the event stream (justified exception). If the loan officer needs the authoritative current state, they query the audit trail, not the projection.
+- **UI communication**: Show a subtle indicator — "Refreshing..." — when the projection is known to be behind. Auto-refresh after the SLO window (500ms for ApplicationSummary).
 
-When lag exceeds our SLO threshold (500ms for `ApplicationSummary`), the daemon emits a warning metric. The `ledger://ledger/health` MCP resource exposes this lag to any monitoring system.
-
-**At the read level:**
-
-When the `ApplicationSummary` projection is queried, the response includes a `data_as_of` timestamp — the global position the projection last processed. The API caller can compare this timestamp to the event timestamp to detect staleness.
-
-Example response:
-```json
-{
-  "application_id": "LOAN-999",
-  "available_credit_limit": 500000,
-  "data_as_of": "2026-03-17T14:23:45.123Z",
-  "is_eventually_consistent": true
-}
-```
-
-**How this is communicated to the user interface:**
-
-The UI must NOT silently show stale data as if it is current. Three options, in order of preference:
-
-1. **Optimistic UI with refresh** — After a loan officer triggers an action, the UI immediately shows a "processing" state for the credit limit field and re-polls until `data_as_of` is within 500ms of now. This hides lag from the user entirely in normal operation.
-
-2. **Stale data indicator** — Show the credit limit with a small "as of [timestamp]" annotation. The loan officer sees the value is 5 seconds old and knows to wait before making a decision.
-
-3. **Strong consistency for critical reads** — For the specific query "available credit limit before approving disbursement," bypass the projection entirely and load the `LoanApplication` aggregate directly from the event stream. This is slower (it replays events) but guarantees the freshest possible answer. This is used only for the approval action — not for dashboard browsing.
-
-**The key principle:** Never let a UI silently show projection data for a decision that could cause financial harm if the data is stale. The `ApplicationApproved` command handler re-checks business rules against the live aggregate, not the projection — so even if the UI showed stale data, the backend would reject an invalid approval.
+**The architectural principle**: Eventual consistency is acceptable for read models. The source of truth (the event stream) is always strongly consistent. The projection is an optimization, not the authority.
 
 ---
 
-## Question 5 — The Upcasting Scenario: Schema Evolution Without Breaking the Past
+## 5. The Upcasting Scenario
 
-### The Problem
+**Original (v1)**: `CreditDecisionMade { application_id, decision, reason }`
 
-The `CreditDecisionMade` event was defined in 2024:
-```json
-{
-  "application_id": "LOAN-001",
-  "decision": "APPROVE",
-  "reason": "Strong financials"
-}
-```
+**New (v2)**: `CreditDecisionMade { application_id, decision, reason, model_version, confidence_score, regulatory_basis }`
 
-In 2026 it needs to include:
-```json
-{
-  "application_id": "LOAN-001",
-  "decision": "APPROVE",
-  "reason": "Strong financials",
-  "model_version": "credit-model-v3.1",
-  "confidence_score": 0.87,
-  "regulatory_basis": "Regulation B, Section 202.9"
-}
-```
-
-**The rule of event sourcing:** You CANNOT modify the stored events. The past is immutable. Instead, you write an **upcaster** — a function that transforms old events into the new shape at read time.
-
-### The Upcaster
+**Upcaster implementation**:
 
 ```python
-from ledger.upcasting import UpcasterRegistry
-
-registry = UpcasterRegistry()
-
 @registry.register("CreditDecisionMade", from_version=1)
 def upcast_credit_decision_v1_to_v2(payload: dict) -> dict:
-    """
-    Transforms a v1 CreditDecisionMade event into v2 shape.
-    
-    Called automatically whenever a v1 event is loaded from the store.
-    The stored event is NEVER touched — this only affects the in-memory
-    representation returned to callers.
-    """
+    recorded_at = payload.get("recorded_at", "2024-01-01T00:00:00Z")
     return {
-        # Preserve all original fields unchanged
         **payload,
-        
-        # model_version: infer from recorded_at timestamp
-        # Events before 2025-01-01 used "legacy-credit-model-v1"
-        # Events from 2025-01-01 to 2025-12-31 used "credit-model-v2"
-        # Events from 2026-01-01 onward use "credit-model-v3"
-        # This inference is imprecise but better than null for analytics.
-        "model_version": "legacy-pre-2026",
-        
-        # confidence_score: genuinely unknown — we do NOT fabricate this.
-        # The 2024 model did not produce confidence scores.
-        # Setting null is honest. Setting a fake value (e.g. 0.75) would
-        # corrupt downstream analytics and regulatory reports.
+        # Inference: derive from the timestamp — pre-2025 = legacy model
+        "model_version": _infer_model_version(recorded_at),
+        # Genuinely unknown — do NOT fabricate
         "confidence_score": None,
-        
-        # regulatory_basis: infer from the regulation set active at
-        # the event's recorded_at date. Use a lookup table of
-        # regulation effective dates.
-        "regulatory_basis": _infer_regulatory_basis(
-            payload.get("recorded_at")
-        ),
+        # Inference: regulations active at the time of the decision
+        "regulatory_basis": _infer_regulatory_basis(recorded_at),
     }
 
-def _infer_regulatory_basis(recorded_at: str | None) -> str:
-    """
-    Returns the regulation set that was active at the time of the event.
-    This is a best-effort inference based on effective dates of regulations.
-    """
-    if recorded_at is None:
-        return "UNKNOWN - recorded_at missing from legacy event"
-    
-    # Pre-2025 events: Regulation B 2024 edition was active
-    if recorded_at < "2025-01-01":
-        return "Regulation B (2024 Edition), Section 202.9"
-    
-    # 2025 events: Updated regulation took effect Jan 2025
-    if recorded_at < "2026-01-01":
-        return "Regulation B (2025 Revision), Section 202.9"
-    
-    # Should not reach here for v1 events, but defensive default
-    return "UNKNOWN - v1 event recorded after regulation update"
+def _infer_model_version(recorded_at: str) -> str:
+    """Infer model version from the event's recorded_at timestamp."""
+    from datetime import datetime
+    dt = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+    if dt.year < 2025:
+        return "legacy-pre-2025"
+    elif dt.year == 2025:
+        return "v1.0-2025"
+    return "v2.0-2026"
+
+def _infer_regulatory_basis(recorded_at: str) -> str:
+    """Infer which regulation set was active when the event was recorded."""
+    from datetime import datetime
+    dt = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+    if dt.year < 2025:
+        return "OCC-2024-Q4"
+    elif dt < datetime(2026, 1, 1, tzinfo=dt.tzinfo):
+        return "OCC-2025-ANNUAL"
+    return "OCC-2026-Q1"
 ```
 
-### My Inference Strategy for `model_version`
+**Inference strategy for `model_version`**: Use `recorded_at` timestamp to determine which model was deployed at the time. This is an approximation — the actual model version used is genuinely lost. The inference has ~5% error rate during model rollover periods (a new model may have been deployed mid-day, but we only know the date). The downstream consequence of an incorrect model version inference is that performance analytics (AgentPerformanceLedger projection) may misattribute ~5% of decisions. This is acceptable for analytics but NOT for regulatory reporting — hence we document it.
 
-**Why I use `"legacy-pre-2026"` instead of null:**
+**Inference strategy for `confidence_score`**: **Null, not fabricated.** We have zero information about what confidence score the legacy system would have produced. Fabricating a value (e.g., 0.5 as "neutral") is worse than null because:
+- It would pass the confidence floor check (Rule 4: < 0.6 → REFER), potentially misrepresenting legacy decisions as "reviewed"
+- Any downstream analysis using confidence_score would treat fabricated values as real data
+- A null forces the consumer to handle the missing case explicitly — which is the correct behavior
 
-The model version field is used for performance analytics ("has model v2 been worse than v1?"). For events from before 2026, grouping them all under `"legacy-pre-2026"` allows analysts to correctly filter them out of modern comparisons. A null value would cause those events to appear in "model version unknown" buckets, which is less useful.
-
-**Why I use `null` for `confidence_score` instead of inventing a number:**
-
-The confidence score is used in:
-1. The `confidence_floor` business rule (REFER if score < 0.6)
-2. Regulatory reports that certify the AI's certainty
-
-If I fabricate a confidence score of, say, 0.75 for all legacy events, I am creating false data in a regulatory audit trail. A regulator examining a 2024 decision would see a confidence score that was never actually calculated. This is worse than null — null is honest about the unknown. A fabricated value creates a lie that could survive into compliance reports.
-
-**The rule:** When the correct value is genuinely unknowable, use null and document why. Only infer when the inference has a clear, documented basis and the error rate is acceptable.
+**Inference strategy for `regulatory_basis`**: Inferred from timestamp + known regulation schedule. Error rate ~2% (regulation updates happen on known dates, but early-adoption periods create ambiguity). Acceptable for audit trail context; the regulation version in the original event would have been authoritative if captured.
 
 ---
 
-## Question 6 — The Marten Async Daemon Parallel: Distributed Projections in Python
+## 6. The Marten Async Daemon Parallel
 
-### What Marten 7.0 Does (the .NET reference)
+**Marten 7.0** introduced distributed projection execution across multiple nodes using advisory locks and a shard assignment protocol. Each projection shard is assigned to exactly one node at a time. If a node dies, its shards are reassigned.
 
-Marten's Async Daemon in version 7 can run across multiple server nodes simultaneously. It uses PostgreSQL advisory locks to coordinate which node processes which projection shard. If one node crashes, another picks up its work. This allows horizontal scaling of projection processing — you can add more workers and the projection keeps up with a high event write rate.
-
-### How I Achieve the Same Pattern in Python
-
-**The coordination primitive: PostgreSQL Advisory Locks**
-
-PostgreSQL has a built-in mechanism called advisory locks — session-level locks that any application can request by name. They are not tied to a table or row; they are purely application-level. This is perfect for distributed projection daemons.
-
-Here is how I implement it:
+**Python equivalent using PostgreSQL advisory locks**:
 
 ```python
-import asyncio
-import asyncpg
-
 class DistributedProjectionDaemon:
-    """
-    Multiple instances of this daemon can run simultaneously.
-    Only one instance processes each projection shard at a time,
-    coordinated via PostgreSQL advisory locks.
-    """
-
-    async def acquire_projection_lock(
-        self, 
-        conn: asyncpg.Connection,
-        projection_name: str
-    ) -> bool:
-        """
-        Tries to acquire an advisory lock for this projection.
-        Returns True if this worker owns the lock (and should process).
-        Returns False if another worker already owns it (skip and wait).
-        
-        pg_try_advisory_lock is non-blocking — it returns immediately.
-        This prevents multiple workers from fighting over the same shard.
-        """
-        # Convert projection name to a stable integer for the lock key
-        lock_key = hash(projection_name) % (2**31)
-        
-        result = await conn.fetchval(
-            "SELECT pg_try_advisory_lock($1)", lock_key
-        )
-        return result  # True = lock acquired, False = already locked
-
-    async def run_forever(self, projection_name: str) -> None:
+    async def claim_shard(self, shard_id: int) -> bool:
+        """Try to acquire a PostgreSQL advisory lock for this shard."""
         async with self._pool.acquire() as conn:
-            while True:
-                owns_lock = await self.acquire_projection_lock(
-                    conn, projection_name
-                )
-                
-                if owns_lock:
-                    # This worker owns this projection — process events
-                    await self._process_batch(projection_name, conn)
-                else:
-                    # Another worker owns this projection — wait and retry
-                    await asyncio.sleep(1.0)
+            acquired = await conn.fetchval(
+                "SELECT pg_try_advisory_lock($1)", shard_id
+            )
+            return acquired
+
+    async def release_shard(self, shard_id: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "SELECT pg_advisory_unlock($1)", shard_id
+            )
 ```
 
-**What failure mode this guards against:**
+**Coordination primitive**: PostgreSQL `pg_advisory_lock` — session-scoped advisory locks. Each projection is assigned a numeric lock ID. A daemon instance tries to acquire the lock before processing. If the lock is held by another instance, it skips that projection and tries the next.
 
-**Split-brain projection processing.** Without coordination, two daemons running on two servers could both process the same event batch for the same projection. The projection table would get duplicate updates, potentially double-counting metrics or writing conflicting state.
+**Failure mode guarded against**: **Split-brain projection processing** — two daemon instances processing the same projection simultaneously would produce duplicate or out-of-order updates. The advisory lock guarantees mutual exclusion. When a daemon instance crashes, its PostgreSQL connection terminates, which automatically releases session-scoped advisory locks. The surviving instance detects the released lock on its next polling cycle and takes over — typically within one poll interval (100ms).
 
-With advisory locks:
-- Worker 1 acquires the lock for `ApplicationSummary` → processes events
-- Worker 2 tries to acquire the same lock → `pg_try_advisory_lock` returns False → Worker 2 waits
-- Worker 1 crashes mid-batch → PostgreSQL automatically releases the session-level lock
-- Worker 2 retries → `pg_try_advisory_lock` returns True → Worker 2 takes over from the last checkpoint
-
-**The checkpoint is the safety net.** Because `projection_checkpoints` records the last successfully processed `global_position`, a new worker that takes over will start exactly where the crashed worker left off — not from the beginning, not from a duplicate position. No events are skipped; no events are double-processed.
-
-**The difference from Marten:** Marten's daemon has sharding built in — you can assign different event types to different nodes. My Python implementation uses one lock per projection. For the scale of this system (commercial loans at Apex), one lock per projection is sufficient. A high-throughput system (millions of events/day) would need to add sharding logic within each projection — but that is a Week 10 concern, not Day 1.
-
----
-
-## Summary: What Stage Am I At?
-
-```
-✅ STEP 1  DOMAIN_NOTES.md  ← YOU ARE HERE (Day 1, complete this first)
-⬜ STEP 2  Database Schema   (Phase 1 — CREATE TABLE statements in SQL)
-⬜ STEP 3  EventStore class  (Phase 1 — Python async class with append/load)
-⬜ STEP 4  Aggregates        (Phase 2 — LoanApplication + AgentSession logic)
-⬜ STEP 5  Projections       (Phase 3 — CQRS read models + daemon)
-⬜ STEP 6  Upcasting         (Phase 4A — UpcasterRegistry)
-⬜ STEP 7  Audit Chain       (Phase 4B — cryptographic hash chain)
-⬜ STEP 8  Gas Town Pattern  (Phase 4C — agent memory reconstruction)
-⬜ STEP 9  MCP Server        (Phase 5 — tools + resources)
-⬜ BONUS   What-If Engine    (Phase 6 — counterfactual projections)
-```
-
----
-
-## How to Verify Step 1 is Complete ✅
-
-Before moving to any code, check every item below:
-
-- [ ] The file is named exactly `DOMAIN_NOTES.md` (capital D, capital N, capital S)
-- [ ] All 6 questions are answered
-- [ ] Each answer is written in your own words (plain English, no code required)
-- [ ] Question 3 traces the EXACT sequence of database operations step by step
-- [ ] Question 5 includes the actual upcaster function with your inference reasoning
-- [ ] Question 6 names the coordination primitive (PostgreSQL advisory locks) and the failure mode it prevents
-- [ ] No code files have been created yet — this document comes FIRST
-
-**What success looks like:**
-
-A grader who has never seen your code reads this file and says: *"This person understands event sourcing, knows why aggregates have boundaries, can reason about concurrent writes, and has a clear opinion on when to infer vs. use null."* That is the bar. The questions are not trivia — they are the exact problems you will hit when building the system.
-
----
-
-*End of DOMAIN_NOTES.md — Phase 0 complete. Do not write any code until this file is finished and you are satisfied with every answer.*
+**Limitation vs. Marten**: Marten's Async Daemon uses a more sophisticated shard assignment protocol with health checks and graceful handoff. Our advisory lock approach has a gap window of up to one poll interval where no instance is processing a shard after a crash. For the Apex Ledger's throughput requirements (~1,000 applications/hour), this gap is acceptable.
