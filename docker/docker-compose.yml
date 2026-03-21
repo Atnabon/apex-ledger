@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: apex_ledger_db
+    environment:
+      POSTGRES_DB: apex_ledger
+      POSTGRES_USER: apex_user
+      POSTGRES_PASSWORD: apex_secret_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - apex_ledger_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apex_user -d apex_ledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  apex_ledger_data:
