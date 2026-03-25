@@ -39,6 +39,7 @@ from src.models.events import (
     StreamMetadata,
     StreamNotFoundError,
 )
+from src.upcasting.registry import registry as _upcaster_registry
 
 
 class EventStore:
@@ -207,7 +208,9 @@ class EventStore:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(query, *params)
 
-        return [self._row_to_stored_event(row) for row in rows]
+        events = [self._row_to_stored_event(row) for row in rows]
+        # Transparently apply upcasting so callers always see the latest schema
+        return _upcaster_registry.upcast_batch(events)
 
     async def load_all(
         self,
@@ -251,6 +254,8 @@ class EventStore:
 
             for row in rows:
                 event = self._row_to_stored_event(row)
+                # Transparently apply upcasting on the load path
+                event = _upcaster_registry.upcast(event)
                 position = event.global_position
                 yield event
 
