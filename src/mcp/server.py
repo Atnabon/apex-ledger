@@ -10,7 +10,7 @@ import asyncio
 import os
 from fastmcp import FastMCP
 
-mcp = FastMCP("apex-ledger", description="The Ledger — Agentic Event Store & Enterprise Audit Infrastructure")
+mcp = FastMCP("apex-ledger", instructions="The Ledger — Agentic Event Store & Enterprise Audit Infrastructure")
 
 # Import tools and resources to register them
 from src.mcp.tools import register_tools

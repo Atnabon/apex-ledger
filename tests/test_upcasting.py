@@ -202,24 +202,25 @@ async def test_immutability_guarantee(pool, store: EventStore):
         await conn.execute(
             "INSERT INTO events (event_id, stream_id, stream_position, event_type, "
             "event_version, payload, metadata) "
-            "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)",
+            "VALUES ($1, $2, $3, $4, $5, $6, $7)",
             event_id, stream_id, 1, "CreditAnalysisCompleted", 1,
-            __import__("json").dumps(v1_payload),
-            __import__("json").dumps({}),
+            v1_payload,
+            {},
         )
 
-    # Step 2: Load through EventStore
+    # Step 2: Load through EventStore — upcasting is transparent on the load path
     loaded_events = await store.load_stream(stream_id)
     assert len(loaded_events) == 1
     loaded_event = loaded_events[0]
-    assert loaded_event.event_version == 1  # store returns raw version
+    # The event store automatically upcasts: loaded event is already at v2
+    assert loaded_event.event_version == 2
+    assert loaded_event.payload["confidence_score"] is None
+    assert "model_version" in loaded_event.payload
+    assert "regulatory_basis" in loaded_event.payload
 
-    # Step 3: Apply upcaster manually (as a consumer would)
+    # Step 3: Calling upcast again is a no-op — v2 has no further upcasters
     upcasted = registry.upcast(loaded_event)
     assert upcasted.event_version == 2
-    assert upcasted.payload["confidence_score"] is None
-    assert "model_version" in upcasted.payload
-    assert "regulatory_basis" in upcasted.payload
 
     # Step 4: Query the raw events table — stored payload must be UNCHANGED
     async with pool.acquire() as conn:
@@ -246,9 +247,9 @@ async def test_immutability_guarantee(pool, store: EventStore):
     assert raw_payload["risk_tier"] == "HIGH"
 
     print("\n--- Immutability Guarantee Test PASSED ---")
-    print(f"  Upcasted version: {upcasted.event_version}")
+    print(f"  Upcasted version: {loaded_event.event_version}")
     print(f"  Stored version:   {row['event_version']}")
-    print(f"  Upcasted has model_version: {'model_version' in upcasted.payload}")
+    print(f"  Upcasted has model_version: {'model_version' in loaded_event.payload}")
     print(f"  Stored has model_version:   {'model_version' in raw_payload}")
 
 

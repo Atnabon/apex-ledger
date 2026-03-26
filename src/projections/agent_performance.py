@@ -90,14 +90,12 @@ class AgentPerformanceLedgerProjection:
         # AgentSessionCompleted does not carry model_version directly;
         # fall back to 'unknown' — in practice, the row was already created
         # by AgentSessionStarted with the correct model_version.
-        model_version = payload.get("model_version", "unknown")
-        await self._ensure_row(conn, agent_id, model_version, event.recorded_at)
         await conn.execute(
             """UPDATE agent_performance
                SET sessions_completed = sessions_completed + 1,
-                   last_seen_at = $3
-               WHERE agent_id = $1 AND model_version = $2""",
-            agent_id, model_version, event.recorded_at,
+                   last_seen_at = $2
+               WHERE agent_id = $1""",
+            agent_id, event.recorded_at,
         )
 
     async def _handle_CreditAnalysisCompleted(
